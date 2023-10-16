@@ -1,2 +1,2 @@
 # optimization-station
-Contains Various 
+Bryan Huckleberry is the name, Optimizing Algorithms is the Game 
