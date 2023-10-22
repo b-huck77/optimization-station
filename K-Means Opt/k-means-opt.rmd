@@ -1,0 +1,316 @@
+---
+title: "Optimizing K-Means Tuning, Fall 2023"
+author: "Bryan Huckleberry"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+header-includes:
+   - \usepackage{float}
+output: 
+  pdf_document:
+    number_sections: true
+---
+
+```{r setup, echo = FALSE, message=FALSE, warning=FALSE}
+# load in useful packages
+require(tidyverse)
+require(R.utils)
+require(ggthemes)
+require(Rcpp)
+require(doParallel)
+require(future)
+require(future.apply)
+require(foreach)
+require(parallel)
+
+
+# set default knitr chunks
+knitr::opts_chunk$set(
+  echo = FALSE,  # don't print the code chunk
+  warning = FALSE,  # don't print warnings
+  message = FALSE,  # don't print messages
+  fig.width = 6,  # set default width of figures
+  fig.height = 4,  # set default height of figures
+  fig.align = "center",  # always align figure in center
+  fig.pos = "H",  # always plot figure at the exact location of the code chunk
+  cache = FALSE)  # don't cache results
+  dpi = 300
+  dev = 'png'
+
+```
+
+
+```{r load-data}
+load("data/lingBinary.Rdata")
+```
+
+# Memory Efficiency 
+
+```{r}
+#Load R Helper S Scripts
+sourceDirectory("./R/", modifiedOnly = F, recursive = F)
+sourceCpp('R/similarity.cpp')
+```
+
+For background on the algorithm being implemented, see reference [1]. 
+
+My version of similarityRcpp only has to store numerical doubles and the given membership vectors. This is because Ben-Hurs correlation metric for similarity is only based on 3 dot products. The calculation for each dot product shown on page 3 of [1] is only a sum of the product of two boolean values. Instead of storing each boolean in a qxq C matrix, we can just calculate every term of each dot product directly. Additionally, each C matrix, by definition, is symmetric with values of 0 on the diagonal. Thus, we only need to calculate two booleans for every i < j and that is enough to update each dot product needed for the similarity calculation. 
+
+```{r}
+oneSampleLoopTest <- function(m, k, seedy) {
+  # Tests Computing Correlation Similarity of 2 generated samples from LingBinary 
+  # Args:
+  #     seedy: seed to initialize sample generation
+  #     k: number of clusters to test (from foreach loop)
+  #     m: size of sample as fraction of size of LingBinary
+  # Returns: Outcome of 1 interior loop of Algorithm 1 (Similarity Calculation)
+  
+  # Set seed for sample generation
+  set.seed(seedy)
+  
+  # Create 2 row samples from LingBinary
+  samp_1 <- sample_frac(lingBinary, m)
+  samp_2 <- sample_frac(lingBinary, m)
+  
+  # Calculate clustering for each sample
+  samp_1$cluster <- kmeans(samp_1 %>% 
+    select(-c('ID','CITY','STATE','ZIP','lat','long')), k)$cluster
+  
+  samp_2$cluster <- kmeans(samp_2 %>% 
+    select(-c('ID','CITY','STATE','ZIP','lat','long')), k)$cluster
+  
+  # Create joint dataframe of shared sample rows
+  intersect <- samp_1 %>% 
+    inner_join(samp_2, by = join_by(ID))
+  
+  # Create Membership vectors for use in Similarity function
+  l1 <- intersect$cluster.x
+  l2 <- intersect$cluster.y
+  
+  # Calculate Similarity of sample clusters
+  similarityRcpp(l1, l2)
+}
+```
+
+# Speed Test for Different Values of M
+
+```{r}
+m_vals <- seq(0.025,0.4,0.025)
+sims_r <- numeric(length(m_vals))
+sims_cpp <- numeric(length(m_vals))
+r_time <- numeric(length(m_vals))
+cpp_time <- numeric(length(m_vals))
+r_cpp_ratio <- numeric(length(m_vals))
+
+# Replication of Code from One_sample purely for timing
+# similarity function from Rcpp vs R
+
+for(i in 1:length(m_vals)) {
+  
+  mi <- m_vals[i]
+
+  set.seed(2115)
+  samp_1 <- sample_frac(lingBinary, mi)
+  samp_2 <- sample_frac(lingBinary, mi)
+
+  samp_1$cluster <- kmeans(samp_1 %>% 
+    select(-c('ID','CITY','STATE','ZIP','lat','long')), 2)$cluster
+
+  samp_2$cluster <- kmeans(samp_2 %>% 
+    select(-c('ID','CITY','STATE','ZIP','lat','long')), 2)$cluster
+
+  intersect <- samp_1 %>% 
+    inner_join(samp_2, by = join_by(ID))
+
+  l1 <- intersect$cluster.x
+  l2 <- intersect$cluster.y
+  
+  start <- Sys.time()
+  sim_r <- similarity(l1, l2)
+  end <- Sys.time()
+  
+  sims_r[i] <- sim_r
+
+  r_time[i] <- end - start
+
+  start <- Sys.time()
+  sim_cpp <- similarityRcpp(l1, l2)
+  end <- Sys.time()
+  
+  sims_cpp[i] <- sim_cpp
+  
+  cpp_time[i] <- end - start
+  
+  r_cpp_ratio[i] <- r_time[i]/cpp_time[i]
+}
+
+
+speed_df <- data.frame(m_vals, sims_r, sims_cpp, r_time, cpp_time, r_cpp_ratio)
+```
+
+```{r}
+speed_df$r_cpp_ratio[is.infinite(speed_df$r_cpp_ratio)] <- NA
+avg_ratio = mean(speed_df$r_cpp_ratio, na.rm = TRUE)
+
+ggplot(speed_df, aes(x = m_vals)) +
+  geom_line(aes(y = log(r_time), color = "r")) +
+  geom_line(aes(y = log(cpp_time), color = "cpp")) +
+  theme_solarized() +
+  scale_color_manual(values = c('red', 'blue'), name = 'Lang.') +
+  labs(x = 'Size of Subsets as Fraction of Rows in Data', y = "Log(time)")
+```
+
+\center Figure 1: Comparison of Computing Time for Each Implementation of Similarity \center
+
+\raggedright
+
+```{r}
+
+paste("The average ratio between the time of my r implementation vs my cpp implementation is",
+      round(avg_ratio, 2))
+```
+
+The time of my c++ implementation is faster to the point where I needed to use a logarithmic scale in fig.1. There is inherent variability due to the randomness of subset selection from LingBinary. For smaller values of m there is a lower likelihood of a large intersection between each subset from the table. From this seed the general trend of c++'s efficiency is visible. 
+
+
+# Algorithm
+```{r algorithm, eval = FALSE}
+#Set Fixed Global Variables From Lab Instructions
+k_max <- 10
+N <- 100
+m <- 0.5
+
+# Set Seed for replicability of findings
+set.seed(215)
+
+# Set number of cores for use on SCF machine
+n_cores <- 9
+registerDoParallel(n_cores)
+
+s_mat <- foreach(k = 2:k_max, .combine = "cbind", 
+        .packages = c("tidyverse", "R.utils", "Rcpp"),
+        .noexport = "similarityRcpp") %dopar% {
+  sourceCpp('R/similarity.cpp')
+  dummy <- 1:N
+  
+  oneSampleLoop <- function(n) {
+    # Computes Correlation Similarity of 2 generated samples from LingBinary 
+    # Args:
+    #     n: Dummy variable to allow use of function with lapply
+    # Inherited Args:
+    #     k: number of clusters to test (from foreach loop)
+    #     m: size of sample as fraction of size of LingBinary
+    # Returns: Outcome of 1 interior loop of Algorithm 1 (Similarity Calculation)
+    
+    # Create 2 row samples from LingBinary
+    samp_1 <- sample_frac(lingBinary, m)
+    samp_2 <- sample_frac(lingBinary, m)
+    
+    # Calculate clustering for each sample
+    samp_1$cluster <- kmeans(samp_1 %>% 
+      select(-c('ID','CITY','STATE','ZIP','lat','long')), k)$cluster
+    
+    samp_2$cluster <- kmeans(samp_2 %>% 
+      select(-c('ID','CITY','STATE','ZIP','lat','long')), k)$cluster
+    
+    # Create joint dataframe of shared sample rows
+    intersect <- samp_1 %>% 
+      inner_join(samp_2, by = join_by(ID))
+    
+    # Create Membership vectors for use in Similarity function
+    l1 <- intersect$cluster.x
+    l2 <- intersect$cluster.y
+    
+    # Calculate Similarity of sample clusters
+    similarityRcpp(l1, l2)
+  }
+  
+  # Perform N sample loops and store all
+  lapply(dummy, oneSampleLoop)
+  
+}
+
+write.csv(s_mat, "results/s_mat.csv")
+```
+
+
+```{r}
+# Load results csv from Algorithm 1
+s_df <- read.csv("results/s_mat.csv")
+```
+
+
+```{r}
+# Format Results Dataframe
+s_df <- s_df %>% 
+  select(-c("X")) %>%
+  rename(k2 = result.1,
+         k3 = result.2,
+         k4 = result.3,
+         k5 = result.4,
+         k6 = result.5,
+         k7 = result.6,
+         k8 = result.7,
+         k9 = result.8,
+         k10 = result.9,
+         )
+
+```
+
+```{r}
+
+
+#ggplot(s_df, aes(x = k2)) +
+#  geom_histogram(breaks = seq(0.5,1,0.05))
+
+ecdf_colors = c('pink', 'red', 'orange', 'yellow', 'green', 'lightblue', 'blue', 'purple', 'black')
+
+ggplot(s_df) + 
+  stat_ecdf(aes(x = k2, color = '2')) +
+  stat_ecdf(aes(x = k3, color = '3')) +
+  stat_ecdf(aes(x = k4, color = '4')) +
+  stat_ecdf(aes(x = k5, color = '5')) +
+  stat_ecdf(aes(x = k6, color = '6')) +
+  stat_ecdf(aes(x = k7, color = '7')) +
+  stat_ecdf(aes(x = k8, color = '8')) +
+  stat_ecdf(aes(x = k9, color = '9')) +
+  stat_ecdf(aes(x = k10, color = '10')) +
+  theme_dark() +
+  scale_color_manual(values = ecdf_colors, name = "Num. Clusters") +
+  labs(x = "Similarity", y = "Proportion of Sample Values at or Below x")
+```
+\center Figure 2: Empirical CDF of Similarity Values in Results for Each K \center
+
+\raggedright
+
+Based on the outcome of my algorithm, I would choose the optimal value of k for the LingBinary dataset to be 3. This is due to the observation that - more so than any other value of k - the overwhelming majority of similarity measurements are greater than 90%. This means using k = 3 is producing clusters of high similarity across many perturbations of samples from the dataset. Observing the other options, each choice has at least 25% of similarity values being less than 80%. Clearly there is a huge gap in the average similarity in clusters when selecting 3 groupings versus any other choice.  
+
+There are degrees to which I would have faith in this methodology. I believe the algorithm does a good job of identifying the optimal number of clusters when the relative size of clusters in the dataset doesn't differ tremendously. The issue with subset selection is that smaller, outlier clusters which may be present in the data are going to be more difficult to identify across subsets since it is more likely a small subset will have a larger majority of points from the larger clusters. Here the algorithm shows the most stability for 3 clusters, but it is very possible that a really compact, yet smaller, cluster exists which is not being captured in the intersection between each random subset. Therefore, most of the subsets compared will try to force points from the 3 dominating clusters into 4 clusters and will therefore produce lower similarity. Stability and robustness come at a cost of obscuring abnormalities in the dataset. Subsets of data are less likely to contain outlier values because these values represent a much smaller proportion of the entire dataset. 
+
+To summarize, while I have trust in this method I do not consider it to be a universally optimal choice for tuning the cluster parameter. I have confidence that the Ben-Hur algorithm will identify the larger groupings within a given dataset for a sufficient choice of N. Therefore, I believe it is a good choice for looking at large-scale partitions of the dataset. However, the algorithm is less reliable for identifying relatively small, yet potentially very compact, groups. 
+
+# Academic Integrity Statement
+
+All work presented in this report was conducted by myself. This includes the creation of all plot, analysis of findings, and written information. Any information collected from external sources has been cited accordingly.
+
+# Collaborator
+
+Worked without collaborators for this report
+
+# Bibliography
+
+[1] Asa Ben-Hur, André Elisseeff, and Isabelle Guyon. A stability based method for discovering structure in
+clustered data. In Pacific symposium on biocomputing, volume 7, pages 6–17, 2001.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
